@@ -1,0 +1,2305 @@
+===================================================================
+FILE: client/src/pages/BoardPage.tsx
+===================================================================
+import {
+  closestCorners,
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
+import { arrayMove, sortableKeyboardCoordinates } from "@dnd-kit/sortable";
+import { useEffect, useState } from "react";
+import { useParams } from "react-router";
+import { Spinner } from "@/components/ui/Spinner";
+import { BoardColumn } from "@/features/boards/components/BoardColumn";
+import { TaskCard } from "@/features/boards/components/TaskCard";
+import { useBoard } from "@/features/boards/hooks";
+import {
+  useDeleteTask,
+  useMoveTask,
+  useUpdateTask,
+} from "@/features/tasks/hooks";
+import type { Column, Task } from "@/types";
+
+export default function BoardPage() {
+  const { boardId = "" } = useParams();
+  const { data: board, isLoading, isError } = useBoard(boardId);
+
+  const [columns, setColumns] = useState<Column[]>([]);
+  const [activeTask, setActiveTask] = useState<Task | null>(null);
+
+  const moveTaskMutation = useMoveTask(boardId);
+  const updateTaskMutation = useUpdateTask(boardId);
+  const deleteTaskMutation = useDeleteTask(boardId);
+
+  // Keep local DnD state in sync with the server data.
+  useEffect(() => {
+    if (board) setColumns(board.columns);
+  }, [board]);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  function findColumnId(id: string): string | undefined {
+    if (columns.some((c) => c.id === id)) return id;
+    return columns.find((c) => c.tasks.some((t) => t.id === id))?.id;
+  }
+
+  function handleDragStart(event: DragStartEvent) {
+    const id = String(event.active.id);
+    const task =
+      columns.flatMap((c) => c.tasks).find((t) => t.id === id) ?? null;
+    setActiveTask(task);
+  }
+
+  function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    setActiveTask(null);
+    if (!over) return;
+
+    const activeId = String(active.id);
+    const overId = String(over.id);
+    if (activeId === overId) return;
+
+    const fromColId = findColumnId(activeId);
+    const toColId = findColumnId(overId);
+    if (!fromColId || !toColId) return;
+
+    const fromCol = columns.find((c) => c.id === fromColId)!;
+    const toCol = columns.find((c) => c.id === toColId)!;
+    const oldIndex = fromCol.tasks.findIndex((t) => t.id === activeId);
+    if (oldIndex === -1) return;
+
+    // Where in the target column are we dropping?
+    const overIsColumn = toCol.id === overId;
+    const overIndex = toCol.tasks.findIndex((t) => t.id === overId);
+    const rawIndex =
+      overIsColumn || overIndex === -1 ? toCol.tasks.length : overIndex;
+
+    if (fromColId === toColId) {
+      const targetIndex = Math.min(rawIndex, toCol.tasks.length - 1);
+      if (oldIndex === targetIndex) return;
+      setColumns((prev) =>
+        prev.map((c) =>
+          c.id === toColId
+            ? { ...c, tasks: arrayMove(c.tasks, oldIndex, targetIndex) }
+            : c,
+        ),
+      );
+      moveTaskMutation.mutate({
+        taskId: activeId,
+        columnId: toColId,
+        position: targetIndex,
+      });
+    } else {
+      const movedTask: Task = { ...fromCol.tasks[oldIndex], columnId: toColId };
+      setColumns((prev) =>
+        prev.map((c) => {
+          if (c.id === fromColId)
+            return { ...c, tasks: c.tasks.filter((t) => t.id !== activeId) };
+          if (c.id === toColId) {
+            const next = [...c.tasks];
+            next.splice(rawIndex, 0, movedTask);
+            return { ...c, tasks: next };
+          }
+          return c;
+        }),
+      );
+      moveTaskMutation.mutate({
+        taskId: activeId,
+        columnId: toColId,
+        position: rawIndex,
+      });
+    }
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex justify-center py-20">
+        <Spinner />
+      </div>
+    );
+  }
+  if (isError || !board) {
+    return <p className="text-sm text-red-600">Could not load this board.</p>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-semibold tracking-tight">{board.title}</h1>
+
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCorners}
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+      >
+        <div className="flex gap-4 overflow-x-auto pb-4">
+          {columns.map((column) => (
+            <BoardColumn
+              key={column.id}
+              column={column}
+              boardId={boardId}
+              onToggleTask={(task) =>
+                updateTaskMutation.mutate({
+                  taskId: task.id,
+                  completed: !task.completed,
+                })
+              }
+              onDeleteTask={(taskId) => deleteTaskMutation.mutate(taskId)}
+            />
+          ))}
+        </div>
+
+        <DragOverlay>
+          {activeTask ? <TaskCard task={activeTask} /> : null}
+        </DragOverlay>
+      </DndContext>
+    </div>
+  );
+}
+
+
+===================================================================
+FILE: client/src/pages/BoardsPage.tsx
+===================================================================
+import { useState, type FormEvent } from "react";
+import { Link } from "react-router";
+import { Button } from "@/components/ui/Button";
+import { Card, CardContent } from "@/components/ui/Card";
+import { Input } from "@/components/ui/Input";
+import { Spinner } from "@/components/ui/Spinner";
+import {
+  useBoards,
+  useCreateBoard,
+  useDeleteBoard,
+} from "@/features/boards/hooks";
+
+export default function BoardsPage() {
+  const { data: boards, isLoading } = useBoards();
+  const createBoard = useCreateBoard();
+  const deleteBoard = useDeleteBoard();
+  const [title, setTitle] = useState("");
+
+  function handleCreate(e: FormEvent) {
+    e.preventDefault();
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    createBoard.mutate(trimmed);
+    setTitle("");
+  }
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-semibold tracking-tight">Boards</h1>
+
+      <form onSubmit={handleCreate} className="flex gap-2">
+        <Input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="New board title"
+          className="max-w-xs"
+        />
+        <Button type="submit" disabled={createBoard.isPending}>
+          {createBoard.isPending ? "Creating…" : "Create board"}
+        </Button>
+      </form>
+
+      {isLoading ? (
+        <div className="flex justify-center py-20">
+          <Spinner />
+        </div>
+      ) : !boards || boards.length === 0 ? (
+        <Card>
+          <CardContent>
+            <p className="text-sm text-neutral-500">
+              No boards yet. Create your first one above.
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {boards.map((board) => (
+            <Card
+              key={board.id}
+              className="transition-colors hover:border-brand-300"
+            >
+              <CardContent className="flex items-center justify-between">
+                <Link
+                  to={`/boards/${board.id}`}
+                  className="font-medium hover:text-brand-600"
+                >
+                  {board.title}
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => deleteBoard.mutate(board.id)}
+                  className="text-xs text-neutral-400 hover:text-red-600"
+                >
+                  Delete
+                </button>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+===================================================================
+FILE: client/src/features/boards/components/TaskCard.tsx
+===================================================================
+import { Badge } from "@/components/ui/Badge";
+import { cn } from "@/lib/cn";
+import type { Priority, Task } from "@/types";
+
+const priorityVariant: Record<
+  Priority,
+  "neutral" | "brand" | "warning" | "danger"
+> = {
+  LOW: "neutral",
+  MEDIUM: "brand",
+  HIGH: "warning",
+  URGENT: "danger",
+};
+
+interface TaskCardProps {
+  task: Task;
+  onToggle?: () => void;
+  onDelete?: () => void;
+  dragging?: boolean;
+}
+
+export function TaskCard({
+  task,
+  onToggle,
+  onDelete,
+  dragging,
+}: TaskCardProps) {
+  return (
+    <div
+      className={cn(
+        "rounded-lg border border-neutral-200 bg-white p-3 shadow-sm dark:border-neutral-700 dark:bg-neutral-800",
+        dragging && "opacity-50",
+      )}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <p
+          className={cn(
+            "text-sm font-medium",
+            task.completed && "text-neutral-400 line-through",
+          )}
+        >
+          {task.title}
+        </p>
+        <Badge variant={priorityVariant[task.priority]}>
+          {task.priority.toLowerCase()}
+        </Badge>
+      </div>
+
+      {(onToggle || onDelete) && (
+        <div className="mt-2 flex items-center gap-3 text-xs">
+          {onToggle && (
+            <button
+              type="button"
+              onClick={onToggle}
+              className="text-neutral-500 hover:text-brand-600"
+            >
+              {task.completed ? "Undo" : "Done"}
+            </button>
+          )}
+          {onDelete && (
+            <button
+              type="button"
+              onClick={onDelete}
+              className="text-neutral-500 hover:text-red-600"
+            >
+              Delete
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+===================================================================
+FILE: client/src/features/boards/components/SortableTaskCard.tsx
+===================================================================
+import { useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import type { Task } from "@/types";
+import { TaskCard } from "./TaskCard";
+
+interface Props {
+  task: Task;
+  onToggle: () => void;
+  onDelete: () => void;
+}
+
+export function SortableTaskCard({ task, onToggle, onDelete }: Props) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
+    id: task.id,
+    data: { type: "task", columnId: task.columnId },
+  });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+      <TaskCard
+        task={task}
+        onToggle={onToggle}
+        onDelete={onDelete}
+        dragging={isDragging}
+      />
+    </div>
+  );
+}
+
+
+===================================================================
+FILE: client/src/features/boards/components/BoardColumn.tsx
+===================================================================
+import { useDroppable } from "@dnd-kit/core";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import type { Column, Task } from "@/types";
+import { AddTaskForm } from "./AddTaskForm";
+import { SortableTaskCard } from "./SortableTaskCard";
+
+interface Props {
+  column: Column;
+  boardId: string;
+  onToggleTask: (task: Task) => void;
+  onDeleteTask: (taskId: string) => void;
+}
+
+export function BoardColumn({
+  column,
+  boardId,
+  onToggleTask,
+  onDeleteTask,
+}: Props) {
+  const { setNodeRef } = useDroppable({
+    id: column.id,
+    data: { type: "column" },
+  });
+  const taskIds = column.tasks.map((t) => t.id);
+
+  return (
+    <div className="flex w-72 shrink-0 flex-col rounded-xl bg-neutral-100 p-3 dark:bg-neutral-900/60">
+      <div className="mb-3 flex items-center justify-between px-1">
+        <h3 className="text-sm font-semibold">{column.title}</h3>
+        <span className="text-xs text-neutral-400">{column.tasks.length}</span>
+      </div>
+
+      <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
+        <div ref={setNodeRef} className="flex min-h-2 flex-1 flex-col gap-2">
+          {column.tasks.map((task) => (
+            <SortableTaskCard
+              key={task.id}
+              task={task}
+              onToggle={() => onToggleTask(task)}
+              onDelete={() => onDeleteTask(task.id)}
+            />
+          ))}
+        </div>
+      </SortableContext>
+
+      <AddTaskForm columnId={column.id} boardId={boardId} />
+    </div>
+  );
+}
+
+
+===================================================================
+FILE: client/src/features/boards/components/AddTaskForm.tsx
+===================================================================
+import { useState, type FormEvent } from "react";
+import { Input } from "@/components/ui/Input";
+import { useCreateTask } from "@/features/tasks/hooks";
+
+export function AddTaskForm({
+  columnId,
+  boardId,
+}: {
+  columnId: string;
+  boardId: string;
+}) {
+  const [title, setTitle] = useState("");
+  const { mutate, isPending } = useCreateTask(boardId);
+
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    mutate({ columnId, title: trimmed });
+    setTitle("");
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="mt-2">
+      <Input
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="+ Add task"
+        disabled={isPending}
+        className="h-9 bg-white text-sm dark:bg-neutral-800"
+      />
+    </form>
+  );
+}
+
+
+===================================================================
+FILE: client/src/features/boards/api.ts
+===================================================================
+import { api } from "@/lib/api";
+import type { BoardDetail, BoardSummary } from "@/types";
+
+export async function listBoards(): Promise<BoardSummary[]> {
+  const { data } = await api.get<{ boards: BoardSummary[] }>("/boards");
+  return data.boards;
+}
+
+export async function getBoard(boardId: string): Promise<BoardDetail> {
+  const { data } = await api.get<{ board: BoardDetail }>(`/boards/${boardId}`);
+  return data.board;
+}
+
+export async function createBoard(title: string): Promise<BoardSummary> {
+  const { data } = await api.post<{ board: BoardSummary }>("/boards", {
+    title,
+  });
+  return data.board;
+}
+
+export async function deleteBoard(boardId: string): Promise<void> {
+  await api.delete(`/boards/${boardId}`);
+}
+
+
+===================================================================
+FILE: client/src/features/boards/hooks.ts
+===================================================================
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router";
+import { createBoard, deleteBoard, getBoard, listBoards } from "./api";
+
+export function useBoards() {
+  return useQuery({ queryKey: ["boards"], queryFn: listBoards });
+}
+
+export function useBoard(boardId: string) {
+  return useQuery({
+    queryKey: ["board", boardId],
+    queryFn: () => getBoard(boardId),
+    enabled: Boolean(boardId),
+  });
+}
+
+export function useCreateBoard() {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  return useMutation({
+    mutationFn: (title: string) => createBoard(title),
+    onSuccess: (board) => {
+      qc.invalidateQueries({ queryKey: ["boards"] });
+      navigate(`/boards/${board.id}`);
+    },
+  });
+}
+
+export function useDeleteBoard() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (boardId: string) => deleteBoard(boardId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["boards"] }),
+  });
+}
+
+
+===================================================================
+FILE: client/src/features/tasks/api.ts
+===================================================================
+import { api } from "@/lib/api";
+import type { Priority, Task } from "@/types";
+
+export interface CreateTaskInput {
+  columnId: string;
+  title: string;
+  priority?: Priority;
+}
+
+export async function createTask({
+  columnId,
+  ...body
+}: CreateTaskInput): Promise<Task> {
+  const { data } = await api.post<{ task: Task }>(
+    `/columns/${columnId}/tasks`,
+    body,
+  );
+  return data.task;
+}
+
+export interface UpdateTaskInput {
+  taskId: string;
+  completed?: boolean;
+  title?: string;
+  priority?: Priority;
+}
+
+export async function updateTask({
+  taskId,
+  ...body
+}: UpdateTaskInput): Promise<Task> {
+  const { data } = await api.patch<{ task: Task }>(`/tasks/${taskId}`, body);
+  return data.task;
+}
+
+export async function deleteTask(taskId: string): Promise<void> {
+  await api.delete(`/tasks/${taskId}`);
+}
+
+export interface MoveTaskInput {
+  taskId: string;
+  columnId: string;
+  position: number;
+}
+
+export async function moveTask({
+  taskId,
+  columnId,
+  position,
+}: MoveTaskInput): Promise<void> {
+  await api.patch(`/tasks/${taskId}/move`, { columnId, position });
+}
+
+
+===================================================================
+FILE: client/src/features/tasks/hooks.ts
+===================================================================
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { createTask, deleteTask, moveTask, updateTask } from "./api";
+
+export function useCreateTask(boardId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createTask,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["board", boardId] }),
+  });
+}
+
+export function useUpdateTask(boardId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: updateTask,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["board", boardId] }),
+  });
+}
+
+export function useDeleteTask(boardId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: deleteTask,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["board", boardId] }),
+  });
+}
+
+export function useMoveTask(boardId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: moveTask,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["board", boardId] }),
+  });
+}
+
+
+===================================================================
+FILE: client/src/types/index.ts
+===================================================================
+export type Role = "USER" | "ADMIN";
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: Role;
+}
+
+export interface AuthResponse {
+  user: User;
+  accessToken: string;
+  refreshToken: string;
+}
+
+export type Priority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
+
+export interface Task {
+  id: string;
+  title: string;
+  description: string | null;
+  position: number;
+  priority: Priority;
+  dueDate: string | null;
+  completed: boolean;
+  columnId: string;
+}
+
+export interface Column {
+  id: string;
+  title: string;
+  position: number;
+  boardId: string;
+  tasks: Task[];
+}
+
+export interface BoardSummary {
+  id: string;
+  title: string;
+}
+
+export interface BoardDetail {
+  id: string;
+  title: string;
+  columns: Column[];
+}
+
+
+===================================================================
+FILE: client/src/pages/PomodoroPage.tsx
+===================================================================
+import { useMemo } from "react";
+import { Button } from "@/components/ui/Button";
+import { Card, CardContent } from "@/components/ui/Card";
+import { cn } from "@/lib/cn";
+import {
+  MODE_MINUTES,
+  POMODORO,
+  type PomodoroMode,
+} from "@/features/pomodoro/config";
+import { useLogSession, useTodaySessions } from "@/features/pomodoro/hooks";
+import { usePomodoro } from "@/features/pomodoro/timer";
+
+const MODE_LABEL: Record<PomodoroMode, string> = {
+  FOCUS: "Focus",
+  SHORT_BREAK: "Short break",
+  LONG_BREAK: "Long break",
+};
+
+function formatTime(total: number) {
+  const m = Math.floor(total / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = (total % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+export default function PomodoroPage() {
+  const logSession = useLogSession();
+  const { data: sessions } = useTodaySessions();
+
+  const timer = usePomodoro({
+    onComplete: (finished) => {
+      if (finished === "FOCUS") {
+        logSession.mutate({ type: "FOCUS", duration: POMODORO.FOCUS });
+      }
+    },
+  });
+
+  const totalSeconds = MODE_MINUTES[timer.mode] * 60;
+  const progress =
+    totalSeconds === 0
+      ? 0
+      : ((totalSeconds - timer.secondsLeft) / totalSeconds) * 100;
+
+  const focusToday = useMemo(() => {
+    const focus = (sessions ?? []).filter((s) => s.type === "FOCUS");
+    return {
+      count: focus.length,
+      minutes: focus.reduce((sum, s) => sum + s.duration, 0),
+    };
+  }, [sessions]);
+
+  const secondaryBtn =
+    "bg-neutral-100 text-neutral-700 hover:bg-neutral-200 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700";
+
+  return (
+    <div className="mx-auto max-w-md space-y-6">
+      <h1 className="text-2xl font-semibold tracking-tight">Focus timer</h1>
+
+      <div className="flex gap-2">
+        {(Object.keys(MODE_LABEL) as PomodoroMode[]).map((m) => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => timer.switchMode(m)}
+            className={cn(
+              "flex-1 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+              timer.mode === m
+                ? "bg-brand-600 text-white"
+                : "bg-neutral-100 text-neutral-600 hover:bg-neutral-200 dark:bg-neutral-800 dark:text-neutral-300",
+            )}
+          >
+            {MODE_LABEL[m]}
+          </button>
+        ))}
+      </div>
+
+      <Card>
+        <CardContent className="flex flex-col items-center gap-6 py-10">
+          <span className="font-mono text-6xl font-semibold tabular-nums">
+            {formatTime(timer.secondsLeft)}
+          </span>
+
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+            <div
+              className="h-full rounded-full bg-brand-600 transition-[width] duration-300"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+
+          <div className="flex gap-2">
+            {timer.isRunning ? (
+              <Button onClick={timer.pause}>Pause</Button>
+            ) : (
+              <Button onClick={timer.start} disabled={timer.secondsLeft <= 0}>
+                Start
+              </Button>
+            )}
+            <Button className={secondaryBtn} onClick={timer.reset}>
+              Reset
+            </Button>
+            <Button className={secondaryBtn} onClick={timer.skip}>
+              Skip
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="flex justify-around py-6 text-center">
+          <div>
+            <p className="text-2xl font-semibold">{focusToday.count}</p>
+            <p className="text-xs text-neutral-500">Focus sessions today</p>
+          </div>
+          <div>
+            <p className="text-2xl font-semibold">{focusToday.minutes}</p>
+            <p className="text-xs text-neutral-500">Minutes focused</p>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+
+===================================================================
+FILE: client/src/features/pomodoro/config.ts
+===================================================================
+export const POMODORO = {
+  FOCUS: 25,
+  SHORT_BREAK: 5,
+  LONG_BREAK: 15,
+  longBreakEvery: 4,
+} as const;
+
+export type PomodoroMode = "FOCUS" | "SHORT_BREAK" | "LONG_BREAK";
+
+export const MODE_MINUTES: Record<PomodoroMode, number> = {
+  FOCUS: POMODORO.FOCUS,
+  SHORT_BREAK: POMODORO.SHORT_BREAK,
+  LONG_BREAK: POMODORO.LONG_BREAK,
+};
+
+
+===================================================================
+FILE: client/src/features/pomodoro/timer.ts
+===================================================================
+import { useCallback, useEffect, useRef, useState } from "react";
+import { MODE_MINUTES, POMODORO, type PomodoroMode } from "./config";
+
+const DURATIONS: Record<PomodoroMode, number> = {
+  FOCUS: MODE_MINUTES.FOCUS * 60,
+  SHORT_BREAK: MODE_MINUTES.SHORT_BREAK * 60,
+  LONG_BREAK: MODE_MINUTES.LONG_BREAK * 60,
+};
+
+interface UsePomodoroOptions {
+  onComplete?: (finished: PomodoroMode) => void;
+}
+
+export function usePomodoro({ onComplete }: UsePomodoroOptions = {}) {
+  const [mode, setMode] = useState<PomodoroMode>("FOCUS");
+  const [secondsLeft, setSecondsLeft] = useState(DURATIONS.FOCUS);
+  const [isRunning, setIsRunning] = useState(false);
+  const [focusCount, setFocusCount] = useState(0);
+
+  const endTimeRef = useRef<number | null>(null);
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
+
+  const complete = useCallback(() => {
+    setIsRunning(false);
+    endTimeRef.current = null;
+
+    const finished = mode;
+    onCompleteRef.current?.(finished);
+
+    if (finished === "FOCUS") {
+      const nextCount = focusCount + 1;
+      setFocusCount(nextCount);
+      const next: PomodoroMode =
+        nextCount % POMODORO.longBreakEvery === 0
+          ? "LONG_BREAK"
+          : "SHORT_BREAK";
+      setMode(next);
+      setSecondsLeft(DURATIONS[next]);
+    } else {
+      setMode("FOCUS");
+      setSecondsLeft(DURATIONS.FOCUS);
+    }
+  }, [mode, focusCount]);
+
+  useEffect(() => {
+    if (!isRunning) return;
+
+    if (endTimeRef.current === null) {
+      endTimeRef.current = Date.now() + secondsLeft * 1000;
+    }
+
+    const id = setInterval(() => {
+      const remaining = Math.max(
+        0,
+        Math.round((endTimeRef.current! - Date.now()) / 1000),
+      );
+      setSecondsLeft(remaining);
+      if (remaining <= 0) {
+        clearInterval(id);
+        complete();
+      }
+    }, 250);
+
+    return () => clearInterval(id);
+    // secondsLeft is intentionally excluded: we only seed the target on start/resume.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRunning, complete]);
+
+  const start = useCallback(() => {
+    if (secondsLeft <= 0) return;
+    setIsRunning(true);
+  }, [secondsLeft]);
+
+  const pause = useCallback(() => {
+    setIsRunning(false);
+    if (endTimeRef.current !== null) {
+      const remaining = Math.max(
+        0,
+        Math.round((endTimeRef.current - Date.now()) / 1000),
+      );
+      setSecondsLeft(remaining);
+      endTimeRef.current = null;
+    }
+  }, []);
+
+  const reset = useCallback(() => {
+    setIsRunning(false);
+    endTimeRef.current = null;
+    setSecondsLeft(DURATIONS[mode]);
+  }, [mode]);
+
+  const switchMode = useCallback((next: PomodoroMode) => {
+    setMode(next);
+    setSecondsLeft(DURATIONS[next]);
+    setIsRunning(false);
+    endTimeRef.current = null;
+  }, []);
+
+  const skip = useCallback(() => {
+    switchMode(mode === "FOCUS" ? "SHORT_BREAK" : "FOCUS");
+  }, [mode, switchMode]);
+
+  return {
+    mode,
+    secondsLeft,
+    isRunning,
+    focusCount,
+    start,
+    pause,
+    reset,
+    skip,
+    switchMode,
+  };
+}
+
+
+===================================================================
+FILE: client/src/features/pomodoro/hooks.ts
+===================================================================
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { listTodaySessions, logSession } from "./api";
+
+export function useTodaySessions() {
+  return useQuery({
+    queryKey: ["pomodoro", "today"],
+    queryFn: listTodaySessions,
+  });
+}
+
+export function useLogSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: logSession,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["pomodoro", "today"] }),
+  });
+}
+
+
+===================================================================
+FILE: client/src/pages/AssistantPage.tsx
+===================================================================
+import { useState, type FormEvent } from "react";
+import { Button } from "@/components/ui/Button";
+import { Card, CardContent } from "@/components/ui/Card";
+import { Input } from "@/components/ui/Input";
+import { Spinner } from "@/components/ui/Spinner";
+import {
+  useBreakdownTask,
+  useInsights,
+  useSchedule,
+} from "@/features/ai/hooks";
+
+export default function AssistantPage() {
+  const insights = useInsights();
+  const schedule = useSchedule();
+  const breakdown = useBreakdownTask();
+  const [title, setTitle] = useState("");
+
+  function handleBreakdown(e: FormEvent) {
+    e.preventDefault();
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    breakdown.mutate({ title: trimmed });
+  }
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-semibold tracking-tight">AI assistant</h1>
+
+      {/* Productivity insights */}
+      <Card>
+        <CardContent className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold">Productivity insights</h2>
+            <button
+              type="button"
+              onClick={() => insights.refetch()}
+              disabled={insights.isFetching}
+              className="text-xs text-neutral-500 hover:text-brand-600 disabled:opacity-50"
+            >
+              {insights.isFetching ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          {insights.isLoading ? (
+            <Spinner />
+          ) : insights.isError ? (
+            <p className="text-sm text-red-600">
+              Couldn't generate insights right now.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-sm text-neutral-700 dark:text-neutral-200">
+                {insights.data?.summary ||
+                  "Not enough activity yet to generate insights."}
+              </p>
+              {insights.data && insights.data.recommendations.length > 0 && (
+                <ul className="list-disc space-y-1 pl-5 text-sm text-neutral-600 dark:text-neutral-300">
+                  {insights.data.recommendations.map((rec, i) => (
+                    <li key={i}>{rec}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Suggested schedule */}
+      <Card>
+        <CardContent className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold">Suggested schedule</h2>
+            <button
+              type="button"
+              onClick={() => schedule.refetch()}
+              disabled={schedule.isFetching}
+              className="text-xs text-neutral-500 hover:text-brand-600 disabled:opacity-50"
+            >
+              {schedule.isFetching ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          {schedule.isLoading ? (
+            <Spinner />
+          ) : schedule.isError ? (
+            <p className="text-sm text-red-600">
+              Couldn't build a schedule right now.
+            </p>
+          ) : !schedule.data || schedule.data.length === 0 ? (
+            <p className="text-sm text-neutral-500">
+              No pending tasks to schedule. Add some tasks first.
+            </p>
+          ) : (
+            <ul className="space-y-3">
+              {schedule.data.map((item, i) => (
+                <li key={i} className="border-l-2 border-brand-300 pl-3">
+                  <p className="text-sm font-medium">{item.title}</p>
+                  <p className="text-sm text-neutral-600 dark:text-neutral-300">
+                    {item.recommendation}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Task breakdown */}
+      <Card>
+        <CardContent className="space-y-3">
+          <h2 className="text-sm font-semibold">Break down a task</h2>
+          <form onSubmit={handleBreakdown} className="flex gap-2">
+            <Input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="e.g. Launch the marketing website"
+            />
+            <Button type="submit" disabled={breakdown.isPending}>
+              {breakdown.isPending ? "Thinking…" : "Break down"}
+            </Button>
+          </form>
+
+          {breakdown.isError && (
+            <p className="text-sm text-red-600">
+              Couldn't break down that task. Try again.
+            </p>
+          )}
+          {breakdown.data && breakdown.data.length > 0 && (
+            <ol className="list-decimal space-y-1 pl-5 text-sm text-neutral-700 dark:text-neutral-200">
+              {breakdown.data.map((step, i) => (
+                <li key={i}>{step}</li>
+              ))}
+            </ol>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+
+===================================================================
+FILE: client/src/features/ai/api.ts
+===================================================================
+import { api } from "@/lib/api";
+
+/** Coerce any AI list item (string or object) into a safe display string. */
+function toText(item: unknown): string {
+  if (typeof item === "string") return item;
+  if (item && typeof item === "object") {
+    const o = item as Record<string, unknown>;
+    const val =
+      o.title ?? o.step ?? o.task ?? o.name ?? o.text ?? o.description;
+    return val == null ? "" : String(val);
+  }
+  return item == null ? "" : String(item);
+}
+
+export interface BreakdownInput {
+  title: string;
+  description?: string;
+}
+
+export async function breakdownTask(input: BreakdownInput): Promise<string[]> {
+  const { data } = await api.post<{ subtasks?: unknown }>(
+    "/ai/breakdown",
+    input,
+  );
+  const raw = Array.isArray(data.subtasks) ? data.subtasks : [];
+  return raw.map(toText).filter((s) => s.trim().length > 0);
+}
+
+export interface ScheduleItem {
+  title: string;
+  recommendation: string;
+}
+
+export async function getSchedule(): Promise<ScheduleItem[]> {
+  const { data } = await api.get<{ schedule?: unknown }>("/ai/schedule");
+  const raw = Array.isArray(data.schedule) ? data.schedule : [];
+  return raw.map((item) => {
+    const o = (item ?? {}) as Record<string, unknown>;
+    return {
+      title: toText(o.title ?? o.task),
+      recommendation: toText(o.recommendation ?? o.suggestion ?? o.reason),
+    };
+  });
+}
+
+export interface Insights {
+  summary: string;
+  recommendations: string[];
+}
+
+export async function getInsights(): Promise<Insights> {
+  const { data } = await api.get<{ insights?: Record<string, unknown> }>(
+    "/ai/insights",
+  );
+  const insights = data.insights ?? {};
+  const recs = Array.isArray(insights.recommendations)
+    ? insights.recommendations
+    : [];
+  return {
+    summary: toText(insights.summary),
+    recommendations: recs.map(toText).filter((s) => s.trim().length > 0),
+  };
+}
+
+
+===================================================================
+FILE: client/src/features/ai/hooks.ts
+===================================================================
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { breakdownTask, getInsights, getSchedule } from "./api";
+
+const FIVE_MIN = 5 * 60 * 1000;
+
+export function useBreakdownTask() {
+  return useMutation({ mutationFn: breakdownTask });
+}
+
+export function useSchedule() {
+  return useQuery({
+    queryKey: ["ai", "schedule"],
+    queryFn: getSchedule,
+    staleTime: FIVE_MIN,
+  });
+}
+
+export function useInsights() {
+  return useQuery({
+    queryKey: ["ai", "insights"],
+    queryFn: getInsights,
+    staleTime: FIVE_MIN,
+  });
+}
+
+
+===================================================================
+FILE: server/src/modules/task/task.service.ts
+===================================================================
+import { NotFoundError } from "../../lib/errors.js";
+import { prisma } from "../../lib/prisma.js";
+import type {
+  CreateTaskInput,
+  MoveTaskInput,
+  UpdateTaskInput,
+} from "./task.schemas.js";
+
+async function ensureColumnOwner(userId: string, columnId: string) {
+  const column = await prisma.column.findFirst({
+    where: { id: columnId, board: { userId } },
+    select: { id: true },
+  });
+  if (!column) throw new NotFoundError("Column not found");
+  return column;
+}
+
+async function ensureTaskOwner(userId: string, taskId: string) {
+  const task = await prisma.task.findFirst({ where: { id: taskId, userId } });
+  if (!task) throw new NotFoundError("Task not found");
+  return task;
+}
+
+export async function createTask(
+  userId: string,
+  columnId: string,
+  input: CreateTaskInput,
+) {
+  await ensureColumnOwner(userId, columnId);
+  const count = await prisma.task.count({ where: { columnId } });
+  return prisma.task.create({
+    data: {
+      title: input.title,
+      description: input.description ?? null,
+      priority: input.priority ?? "MEDIUM",
+      dueDate: input.dueDate ?? null,
+      columnId,
+      userId,
+      position: count,
+    },
+  });
+}
+
+export async function getTask(userId: string, taskId: string) {
+  return ensureTaskOwner(userId, taskId);
+}
+
+export async function updateTask(
+  userId: string,
+  taskId: string,
+  input: UpdateTaskInput,
+) {
+  await ensureTaskOwner(userId, taskId);
+  return prisma.task.update({
+    where: { id: taskId },
+    data: {
+      ...(input.title !== undefined && { title: input.title }),
+      ...(input.description !== undefined && {
+        description: input.description,
+      }),
+      ...(input.priority !== undefined && { priority: input.priority }),
+      ...(input.dueDate !== undefined && { dueDate: input.dueDate }),
+      ...(input.completed !== undefined && {
+        completed: input.completed,
+        completedAt: input.completed ? new Date() : null,
+      }),
+    },
+  });
+}
+
+export async function deleteTask(userId: string, taskId: string) {
+  const task = await ensureTaskOwner(userId, taskId);
+  await prisma.$transaction(async (tx) => {
+    await tx.task.delete({ where: { id: task.id } });
+    // close the gap left in the source column
+    await tx.task.updateMany({
+      where: { columnId: task.columnId, position: { gt: task.position } },
+      data: { position: { decrement: 1 } },
+    });
+  });
+}
+
+export async function moveTask(
+  userId: string,
+  taskId: string,
+  input: MoveTaskInput,
+) {
+  const task = await ensureTaskOwner(userId, taskId);
+  await ensureColumnOwner(userId, input.toColumnId);
+
+  await prisma.$transaction(async (tx) => {
+    const sameColumn = task.columnId === input.toColumnId;
+    const destCount = await tx.task.count({
+      where: { columnId: input.toColumnId },
+    });
+    // clamp target index to a valid range
+    const maxIndex = sameColumn ? destCount - 1 : destCount;
+    const toIndex = Math.min(input.toIndex, Math.max(maxIndex, 0));
+
+    if (sameColumn) {
+      if (toIndex === task.position) return;
+
+      if (toIndex > task.position) {
+        await tx.task.updateMany({
+          where: {
+            columnId: task.columnId,
+            position: { gt: task.position, lte: toIndex },
+          },
+          data: { position: { decrement: 1 } },
+        });
+      } else {
+        await tx.task.updateMany({
+          where: {
+            columnId: task.columnId,
+            position: { gte: toIndex, lt: task.position },
+          },
+          data: { position: { increment: 1 } },
+        });
+      }
+
+      await tx.task.update({
+        where: { id: task.id },
+        data: { position: toIndex },
+      });
+    } else {
+      // 1) close the gap in the source column
+      await tx.task.updateMany({
+        where: { columnId: task.columnId, position: { gt: task.position } },
+        data: { position: { decrement: 1 } },
+      });
+      // 2) make room in the destination column
+      await tx.task.updateMany({
+        where: { columnId: input.toColumnId, position: { gte: toIndex } },
+        data: { position: { increment: 1 } },
+      });
+      // 3) move the task
+      await tx.task.update({
+        where: { id: task.id },
+        data: { columnId: input.toColumnId, position: toIndex },
+      });
+    }
+  });
+
+  return prisma.task.findUnique({ where: { id: taskId } });
+}
+
+
+===================================================================
+FILE: server/src/modules/task/task.controller.ts
+===================================================================
+import type { Request, Response } from "express";
+import { param } from "../../lib/validation.js";
+import * as taskService from "./task.service.js";
+import type {
+  CreateTaskInput,
+  MoveTaskInput,
+  UpdateTaskInput,
+} from "./task.schemas.js";
+
+export async function create(req: Request, res: Response) {
+  const task = await taskService.createTask(
+    req.user!.id,
+    param(req, "columnId"),
+    req.body as CreateTaskInput,
+  );
+  res.status(201).json({ task });
+}
+
+export async function getOne(req: Request, res: Response) {
+  const task = await taskService.getTask(req.user!.id, param(req, "taskId"));
+  res.status(200).json({ task });
+}
+
+export async function update(req: Request, res: Response) {
+  const task = await taskService.updateTask(
+    req.user!.id,
+    param(req, "taskId"),
+    req.body as UpdateTaskInput,
+  );
+  res.status(200).json({ task });
+}
+
+export async function move(req: Request, res: Response) {
+  const task = await taskService.moveTask(
+    req.user!.id,
+    param(req, "taskId"),
+    req.body as MoveTaskInput,
+  );
+  res.status(200).json({ task });
+}
+
+export async function remove(req: Request, res: Response) {
+  await taskService.deleteTask(req.user!.id, param(req, "taskId"));
+  res.status(204).send();
+}
+
+
+===================================================================
+FILE: server/src/modules/task/task.routes.ts
+===================================================================
+import { Router } from "express";
+import { authenticate } from "../../middleware/authenticate.js";
+import { validate } from "../../middleware/validate.js";
+import { columnIdParams, taskIdParams } from "../../lib/validation.js";
+import * as taskController from "./task.controller.js";
+import {
+  createTaskSchema,
+  moveTaskSchema,
+  updateTaskSchema,
+} from "./task.schemas.js";
+
+const router = Router();
+router.use(authenticate);
+
+router.post(
+  "/columns/:columnId/tasks",
+  validate({ params: columnIdParams, body: createTaskSchema }),
+  taskController.create,
+);
+router.get(
+  "/tasks/:taskId",
+  validate({ params: taskIdParams }),
+  taskController.getOne,
+);
+router.patch(
+  "/tasks/:taskId",
+  validate({ params: taskIdParams, body: updateTaskSchema }),
+  taskController.update,
+);
+router.patch(
+  "/tasks/:taskId/move",
+  validate({ params: taskIdParams, body: moveTaskSchema }),
+  taskController.move,
+);
+router.delete(
+  "/tasks/:taskId",
+  validate({ params: taskIdParams }),
+  taskController.remove,
+);
+
+export default router;
+
+
+===================================================================
+FILE: server/src/modules/board/board.service.ts
+===================================================================
+import { NotFoundError } from "../../lib/errors.js";
+import { prisma } from "../../lib/prisma.js";
+import type { CreateBoardInput, UpdateBoardInput } from "./board.schemas.js";
+
+const DEFAULT_COLUMNS = ["To Do", "In Progress", "Done"];
+
+// Combines ownership + existence: non-owners simply get "not found".
+export async function ensureBoardOwner(userId: string, boardId: string) {
+  const board = await prisma.board.findFirst({
+    where: { id: boardId, userId },
+    select: { id: true },
+  });
+  if (!board) throw new NotFoundError("Board not found");
+  return board;
+}
+
+export async function listBoards(userId: string) {
+  return prisma.board.findMany({
+    where: { userId },
+    orderBy: { createdAt: "asc" },
+    include: { _count: { select: { columns: true } } },
+  });
+}
+
+export async function getBoard(userId: string, boardId: string) {
+  const board = await prisma.board.findFirst({
+    where: { id: boardId, userId },
+    include: {
+      columns: {
+        orderBy: { position: "asc" },
+        include: { tasks: { orderBy: { position: "asc" } } },
+      },
+    },
+  });
+  if (!board) throw new NotFoundError("Board not found");
+  return board;
+}
+
+export async function createBoard(userId: string, input: CreateBoardInput) {
+  return prisma.board.create({
+    data: {
+      title: input.title,
+      userId,
+      columns: {
+        create: DEFAULT_COLUMNS.map((title, index) => ({
+          title,
+          position: index,
+        })),
+      },
+    },
+    include: {
+      columns: {
+        orderBy: { position: "asc" },
+        include: { tasks: { orderBy: { position: "asc" } } },
+      },
+    },
+  });
+}
+
+export async function updateBoard(
+  userId: string,
+  boardId: string,
+  input: UpdateBoardInput,
+) {
+  await ensureBoardOwner(userId, boardId);
+  return prisma.board.update({
+    where: { id: boardId },
+    data: { title: input.title },
+  });
+}
+
+export async function deleteBoard(userId: string, boardId: string) {
+  await ensureBoardOwner(userId, boardId);
+  await prisma.board.delete({ where: { id: boardId } });
+}
+
+export async function getBoardById(userId: string, boardId: string) {
+  const board = await prisma.board.findFirst({
+    where: { id: boardId, userId },
+    include: {
+      columns: {
+        orderBy: { position: "asc" },
+        include: {
+          tasks: { orderBy: { position: "asc" } },
+        },
+      },
+    },
+  });
+  if (!board) throw new NotFoundError("Board not found");
+  return board;
+}
+
+
+===================================================================
+FILE: server/src/modules/board/board.controller.ts
+===================================================================
+import type { Request, Response } from "express";
+import { param } from "../../lib/validation.js";
+import * as boardService from "./board.service.js";
+import type { CreateBoardInput, UpdateBoardInput } from "./board.schemas.js";
+
+export async function list(req: Request, res: Response) {
+  const boards = await boardService.listBoards(req.user!.id);
+  res.status(200).json({ boards });
+}
+
+export async function getOne(req: Request, res: Response) {
+  const board = await boardService.getBoard(
+    req.user!.id,
+    param(req, "boardId"),
+  );
+  res.status(200).json({ board });
+}
+
+export async function create(req: Request, res: Response) {
+  const board = await boardService.createBoard(
+    req.user!.id,
+    req.body as CreateBoardInput,
+  );
+  res.status(201).json({ board });
+}
+
+export async function update(req: Request, res: Response) {
+  const board = await boardService.updateBoard(
+    req.user!.id,
+    param(req, "boardId"),
+    req.body as UpdateBoardInput,
+  );
+  res.status(200).json({ board });
+}
+
+export async function remove(req: Request, res: Response) {
+  await boardService.deleteBoard(req.user!.id, param(req, "boardId"));
+  res.status(204).send();
+}
+
+
+===================================================================
+FILE: server/src/modules/board/board.routes.ts
+===================================================================
+import { Router } from "express";
+import { authenticate } from "../../middleware/authenticate.js";
+import { validate } from "../../middleware/validate.js";
+import { boardIdParams } from "../../lib/validation.js";
+import * as boardController from "./board.controller.js";
+import { createBoardSchema, updateBoardSchema } from "./board.schemas.js";
+
+const router = Router();
+router.use(authenticate);
+
+router.get("/boards", boardController.list);
+router.post(
+  "/boards",
+  validate({ body: createBoardSchema }),
+  boardController.create,
+);
+router.get(
+  "/boards/:boardId",
+  validate({ params: boardIdParams }),
+  boardController.getOne,
+);
+router.patch(
+  "/boards/:boardId",
+  validate({ params: boardIdParams, body: updateBoardSchema }),
+  boardController.update,
+);
+router.delete(
+  "/boards/:boardId",
+  validate({ params: boardIdParams }),
+  boardController.remove,
+);
+
+export default router;
+
+
+===================================================================
+FILE: server/src/modules/column/column.service.ts
+===================================================================
+import { BadRequestError, NotFoundError } from "../../lib/errors.js";
+import { prisma } from "../../lib/prisma.js";
+import { ensureBoardOwner } from "../board/board.service.js";
+import type {
+  CreateColumnInput,
+  ReorderColumnsInput,
+  UpdateColumnInput,
+} from "./column.schemas.js";
+
+async function ensureColumnOwner(userId: string, columnId: string) {
+  const column = await prisma.column.findFirst({
+    where: { id: columnId, board: { userId } },
+  });
+  if (!column) throw new NotFoundError("Column not found");
+  return column;
+}
+
+export async function createColumn(
+  userId: string,
+  boardId: string,
+  input: CreateColumnInput,
+) {
+  await ensureBoardOwner(userId, boardId);
+  const count = await prisma.column.count({ where: { boardId } });
+  return prisma.column.create({
+    data: { title: input.title, boardId, position: count },
+  });
+}
+
+export async function updateColumn(
+  userId: string,
+  columnId: string,
+  input: UpdateColumnInput,
+) {
+  await ensureColumnOwner(userId, columnId);
+  return prisma.column.update({
+    where: { id: columnId },
+    data: { title: input.title },
+  });
+}
+
+export async function deleteColumn(userId: string, columnId: string) {
+  await ensureColumnOwner(userId, columnId);
+  await prisma.column.delete({ where: { id: columnId } });
+}
+
+export async function reorderColumns(
+  userId: string,
+  boardId: string,
+  input: ReorderColumnsInput,
+) {
+  await ensureBoardOwner(userId, boardId);
+
+  const columns = await prisma.column.findMany({
+    where: { boardId },
+    select: { id: true },
+  });
+  const validIds = new Set(columns.map((c) => c.id));
+  const allValid = input.columnIds.every((id) => validIds.has(id));
+
+  if (input.columnIds.length !== columns.length || !allValid) {
+    throw new BadRequestError(
+      "columnIds must include every column of this board exactly once",
+    );
+  }
+
+  await prisma.$transaction(
+    input.columnIds.map((id, index) =>
+      prisma.column.update({ where: { id }, data: { position: index } }),
+    ),
+  );
+
+  return prisma.column.findMany({
+    where: { boardId },
+    orderBy: { position: "asc" },
+  });
+}
+
+
+===================================================================
+FILE: server/src/modules/column/column.controller.ts
+===================================================================
+import type { Request, Response } from "express";
+import { param } from "../../lib/validation.js";
+import * as columnService from "./column.service.js";
+import type {
+  CreateColumnInput,
+  ReorderColumnsInput,
+  UpdateColumnInput,
+} from "./column.schemas.js";
+
+export async function create(req: Request, res: Response) {
+  const column = await columnService.createColumn(
+    req.user!.id,
+    param(req, "boardId"),
+    req.body as CreateColumnInput,
+  );
+  res.status(201).json({ column });
+}
+
+export async function update(req: Request, res: Response) {
+  const column = await columnService.updateColumn(
+    req.user!.id,
+    param(req, "columnId"),
+    req.body as UpdateColumnInput,
+  );
+  res.status(200).json({ column });
+}
+
+export async function remove(req: Request, res: Response) {
+  await columnService.deleteColumn(req.user!.id, param(req, "columnId"));
+  res.status(204).send();
+}
+
+export async function reorder(req: Request, res: Response) {
+  const columns = await columnService.reorderColumns(
+    req.user!.id,
+    param(req, "boardId"),
+    req.body as ReorderColumnsInput,
+  );
+  res.status(200).json({ columns });
+}
+
+
+===================================================================
+FILE: server/src/modules/column/column.routes.ts
+===================================================================
+import { Router } from "express";
+import { authenticate } from "../../middleware/authenticate.js";
+import { validate } from "../../middleware/validate.js";
+import { boardIdParams, columnIdParams } from "../../lib/validation.js";
+import * as columnController from "./column.controller.js";
+import {
+  createColumnSchema,
+  reorderColumnsSchema,
+  updateColumnSchema,
+} from "./column.schemas.js";
+
+const router = Router();
+router.use(authenticate);
+
+router.post(
+  "/boards/:boardId/columns",
+  validate({ params: boardIdParams, body: createColumnSchema }),
+  columnController.create,
+);
+router.patch(
+  "/boards/:boardId/columns/reorder",
+  validate({ params: boardIdParams, body: reorderColumnsSchema }),
+  columnController.reorder,
+);
+router.patch(
+  "/columns/:columnId",
+  validate({ params: columnIdParams, body: updateColumnSchema }),
+  columnController.update,
+);
+router.delete(
+  "/columns/:columnId",
+  validate({ params: columnIdParams }),
+  columnController.remove,
+);
+
+export default router;
+
+
+===================================================================
+FILE: server/src/modules/ai/ai.service.ts
+===================================================================
+import { Type, type Schema } from "@google/genai";
+import { generateStructured } from "../../lib/gemini.js";
+import { prisma } from "../../lib/prisma.js";
+import type { BreakdownInput } from "./ai.schemas.js";
+
+/* ----------------------------- Task breakdown ----------------------------- */
+
+type BreakdownResult = {
+  subtasks: Array<{ title: string; estimatedMinutes: number }>;
+};
+
+const breakdownResponseSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    subtasks: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          estimatedMinutes: { type: Type.INTEGER },
+        },
+        required: ["title", "estimatedMinutes"],
+      },
+    },
+  },
+  required: ["subtasks"],
+};
+
+export async function breakdownTask(
+  input: BreakdownInput,
+): Promise<BreakdownResult> {
+  const prompt = [
+    "Break this task into a short, ordered list of concrete, actionable subtasks.",
+    `Task title: ${input.title}`,
+    input.description ? `Task details: ${input.description}` : "",
+    "Return between 3 and 8 subtasks. Keep each title concise and give a realistic time estimate in minutes.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return generateStructured<BreakdownResult>({
+    prompt,
+    schema: breakdownResponseSchema,
+    systemInstruction:
+      "You are a productivity assistant that breaks tasks into clear, practical steps.",
+  });
+}
+
+/* ----------------------------- Smart schedule ----------------------------- */
+
+type ScheduleResult = {
+  summary: string;
+  blocks: Array<{
+    taskTitle: string;
+    suggestedStart: string;
+    durationMinutes: number;
+    reason: string;
+  }>;
+};
+
+const scheduleResponseSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    summary: { type: Type.STRING },
+    blocks: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          taskTitle: { type: Type.STRING },
+          suggestedStart: { type: Type.STRING },
+          durationMinutes: { type: Type.INTEGER },
+          reason: { type: Type.STRING },
+        },
+        required: ["taskTitle", "suggestedStart", "durationMinutes", "reason"],
+      },
+    },
+  },
+  required: ["summary", "blocks"],
+};
+
+export async function suggestSchedule(userId: string): Promise<ScheduleResult> {
+  const tasks = await prisma.task.findMany({
+    where: { userId, completed: false },
+    orderBy: [{ dueDate: "asc" }, { priority: "desc" }],
+    take: 20,
+    select: { title: true, priority: true, dueDate: true },
+  });
+
+  if (tasks.length === 0) {
+    return {
+      summary:
+        "You have no pending tasks — enjoy the free time or plan something new!",
+      blocks: [],
+    };
+  }
+
+  const taskLines = tasks
+    .map((t, i) => {
+      const due = t.dueDate
+        ? `, due: ${t.dueDate.toISOString().slice(0, 10)}`
+        : "";
+      return `${i + 1}. ${t.title} — priority: ${t.priority}${due}`;
+    })
+    .join("\n");
+
+  const prompt = [
+    "Create a focused, realistic work schedule for today from these pending tasks.",
+    "Assume an 8-hour workday starting at 09:00 with short breaks.",
+    "Prioritize by urgency (due date) and importance (priority).",
+    "Tasks:",
+    taskLines,
+    "Return time blocks with a suggested start time (HH:MM), a duration in minutes, and a one-line reason each, plus a short overall summary.",
+  ].join("\n");
+
+  return generateStructured<ScheduleResult>({
+    prompt,
+    schema: scheduleResponseSchema,
+    systemInstruction:
+      "You are a scheduling assistant that produces practical, time-boxed daily plans.",
+  });
+}
+
+/* --------------------------- Productivity insights ------------------------ */
+
+type InsightsResult = {
+  summary: string;
+  insights: string[];
+  recommendations: string[];
+};
+
+const insightsResponseSchema: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    summary: { type: Type.STRING },
+    insights: { type: Type.ARRAY, items: { type: Type.STRING } },
+    recommendations: { type: Type.ARRAY, items: { type: Type.STRING } },
+  },
+  required: ["summary", "insights", "recommendations"],
+};
+
+export async function generateInsights(
+  userId: string,
+): Promise<InsightsResult> {
+  const now = new Date();
+
+  const [
+    totalTasks,
+    completedTasks,
+    overdueTasks,
+    tasksByPriority,
+    focusSessions,
+    focusAgg,
+  ] = await Promise.all([
+    prisma.task.count({ where: { userId } }),
+    prisma.task.count({ where: { userId, completed: true } }),
+    prisma.task.count({
+      where: { userId, completed: false, dueDate: { lt: now } },
+    }),
+    prisma.task.groupBy({
+      by: ["priority"],
+      where: { userId, completed: false },
+      _count: { _all: true },
+    }),
+    prisma.pomodoroSession.count({
+      where: { userId, type: "FOCUS", completed: true },
+    }),
+    prisma.pomodoroSession.aggregate({
+      where: { userId, type: "FOCUS", completed: true },
+      _sum: { duration: true },
+    }),
+  ]);
+
+  const completionRate =
+    totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+  const focusMinutes = focusAgg._sum.duration ?? 0; // PomodoroSession.duration is stored in minutes
+  const priorityBreakdown =
+    tasksByPriority.map((p) => `${p.priority}: ${p._count._all}`).join(", ") ||
+    "none";
+
+  const prompt = [
+    "Analyze this user's productivity data and give encouraging, specific, actionable feedback.",
+    `Total tasks: ${totalTasks}`,
+    `Completed tasks: ${completedTasks} (${completionRate}% completion rate)`,
+    `Overdue pending tasks: ${overdueTasks}`,
+    `Pending tasks by priority: ${priorityBreakdown}`,
+    `Completed focus sessions: ${focusSessions}`,
+    `Total focus time: ${focusMinutes} minutes`,
+    "Return a short summary, 2-4 insights, and 2-4 concrete recommendations.",
+  ].join("\n");
+
+  return generateStructured<InsightsResult>({
+    prompt,
+    schema: insightsResponseSchema,
+    systemInstruction:
+      "You are a supportive productivity coach. Be concise, specific, and positive.",
+  });
+}
+
+
+===================================================================
+FILE: server/src/modules/ai/ai.controller.ts
+===================================================================
+import type { Request, Response } from "express";
+import * as aiService from "./ai.service.js";
+import type { BreakdownInput } from "./ai.schemas.js";
+
+export async function breakdown(req: Request, res: Response) {
+  const result = await aiService.breakdownTask(req.body as BreakdownInput);
+  res.status(200).json(result);
+}
+
+export async function schedule(req: Request, res: Response) {
+  const result = await aiService.suggestSchedule(req.user!.id);
+  res.status(200).json(result);
+}
+
+export async function insights(req: Request, res: Response) {
+  const result = await aiService.generateInsights(req.user!.id);
+  res.status(200).json(result);
+}
+
+
+===================================================================
+FILE: server/src/modules/ai/ai.routes.ts
+===================================================================
+import { Router } from "express";
+import { authenticate } from "../../middleware/authenticate.js";
+import { validate } from "../../middleware/validate.js";
+import * as aiController from "./ai.controller.js";
+import { breakdownSchema } from "./ai.schemas.js";
+
+const router = Router();
+router.use(authenticate);
+
+router.post(
+  "/breakdown",
+  validate({ body: breakdownSchema }),
+  aiController.breakdown,
+);
+router.get("/schedule", aiController.schedule);
+router.get("/insights", aiController.insights);
+
+export default router;
+
+
+===================================================================
+FILE: server/prisma/schema.prisma
+===================================================================
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum PomodoroType {
+  FOCUS
+  SHORT_BREAK
+  LONG_BREAK
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  boards           Board[]
+  tasks            Task[]
+  pomodoroSessions PomodoroSession[]
+  timeEntries      TimeEntry[]
+}
+
+model Board {
+  id        String   @id @default(cuid())
+  title     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  columns Column[]
+
+  @@index([userId])
+}
+
+model Column {
+  id        String   @id @default(cuid())
+  title     String
+  position  Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  boardId String
+  board   Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
+
+  tasks Task[]
+
+  @@index([boardId])
+}
+
+model Task {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  position    Int
+  priority    Priority  @default(MEDIUM)
+  dueDate     DateTime?
+  completed   Boolean   @default(false)
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  columnId String
+  column   Column @relation(fields: [columnId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  timeEntries      TimeEntry[]
+  pomodoroSessions PomodoroSession[]
+
+  @@index([columnId])
+  @@index([userId])
+}
+
+model PomodoroSession {
+  id        String       @id @default(cuid())
+  type      PomodoroType @default(FOCUS)
+  duration  Int
+  startedAt DateTime     @default(now())
+  endedAt   DateTime?
+  completed Boolean      @default(false)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  taskId String?
+  task   Task?   @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([taskId])
+}
+
+model TimeEntry {
+  id              String    @id @default(cuid())
+  startedAt       DateTime  @default(now())
+  endedAt         DateTime?
+  durationSeconds Int       @default(0)
+  note            String?
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  taskId String?
+  task   Task?   @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([taskId])
+}
+
+
+===================================================================
+PROJECT TREE (all .ts / .tsx / .prisma under client/src and server/src)
+===================================================================
+client/src/App.tsx
+client/src/app/providers.tsx
+client/src/components/AppLayout.tsx
+client/src/components/ErrorBoundary.tsx
+client/src/components/ProtectedRoute.tsx
+client/src/components/PublicOnlyRoute.tsx
+client/src/components/ui/Badge.tsx
+client/src/components/ui/Button.test.tsx
+client/src/components/ui/Button.tsx
+client/src/components/ui/Card.tsx
+client/src/components/ui/Input.tsx
+client/src/components/ui/Spinner.tsx
+client/src/features/ai/api.ts
+client/src/features/ai/hooks.ts
+client/src/features/analytics/api.ts
+client/src/features/analytics/hooks.ts
+client/src/features/auth/api.ts
+client/src/features/auth/hooks.ts
+client/src/features/boards/api.ts
+client/src/features/boards/components/AddTaskForm.tsx
+client/src/features/boards/components/BoardColumn.tsx
+client/src/features/boards/components/SortableTaskCard.tsx
+client/src/features/boards/components/TaskCard.tsx
+client/src/features/boards/hooks.ts
+client/src/features/pomodoro/api.ts
+client/src/features/pomodoro/config.ts
+client/src/features/pomodoro/hooks.ts
+client/src/features/pomodoro/timer.ts
+client/src/features/tasks/api.ts
+client/src/features/tasks/hooks.ts
+client/src/lib/api.ts
+client/src/lib/cn.test.ts
+client/src/lib/cn.ts
+client/src/lib/env.ts
+client/src/main.tsx
+client/src/pages/AssistantPage.tsx
+client/src/pages/BoardPage.tsx
+client/src/pages/BoardsPage.tsx
+client/src/pages/DashboardPage.tsx
+client/src/pages/LoginPage.tsx
+client/src/pages/PomodoroPage.tsx
+client/src/pages/RegisterPage.tsx
+client/src/stores/auth.ts
+client/src/test/setup.ts
+client/src/types/index.ts
+client/src/vite-env.d.ts
+server/src/app.ts
+server/src/config/env.ts
+server/src/generated/prisma/browser.ts
+server/src/generated/prisma/client.ts
+server/src/generated/prisma/commonInputTypes.ts
+server/src/generated/prisma/enums.ts
+server/src/generated/prisma/internal/class.ts
+server/src/generated/prisma/internal/prismaNamespace.ts
+server/src/generated/prisma/internal/prismaNamespaceBrowser.ts
+server/src/generated/prisma/models.ts
+server/src/generated/prisma/models/Board.ts
+server/src/generated/prisma/models/Column.ts
+server/src/generated/prisma/models/PomodoroSession.ts
+server/src/generated/prisma/models/Task.ts
+server/src/generated/prisma/models/TimeEntry.ts
+server/src/generated/prisma/models/User.ts
+server/src/index.ts
+server/src/lib/errors.ts
+server/src/lib/gemini.ts
+server/src/lib/jwt.ts
+server/src/lib/password.ts
+server/src/lib/prisma.ts
+server/src/lib/validation.ts
+server/src/middleware/authenticate.ts
+server/src/middleware/authorize.ts
+server/src/middleware/errorHandler.ts
+server/src/middleware/validate.ts
+server/src/modules/ai/ai.controller.ts
+server/src/modules/ai/ai.routes.ts
+server/src/modules/ai/ai.schemas.ts
+server/src/modules/ai/ai.service.ts
+server/src/modules/analytics/analytics.controller.ts
+server/src/modules/analytics/analytics.routes.ts
+server/src/modules/analytics/analytics.service.ts
+server/src/modules/auth/auth.controller.ts
+server/src/modules/auth/auth.routes.ts
+server/src/modules/auth/auth.schemas.ts
+server/src/modules/auth/auth.service.ts
+server/src/modules/board/board.controller.ts
+server/src/modules/board/board.routes.ts
+server/src/modules/board/board.schemas.ts
+server/src/modules/board/board.service.ts
+server/src/modules/column/column.controller.ts
+server/src/modules/column/column.routes.ts
+server/src/modules/column/column.schemas.ts
+server/src/modules/column/column.service.ts
+server/src/modules/pomodoro/pomodoro.controller.ts
+server/src/modules/pomodoro/pomodoro.routes.ts
+server/src/modules/pomodoro/pomodoro.schemas.ts
+server/src/modules/pomodoro/pomodoro.service.ts
+server/src/modules/task/task.controller.ts
+server/src/modules/task/task.routes.ts
+server/src/modules/task/task.schemas.ts
+server/src/modules/task/task.service.ts
+server/src/routes/health.routes.ts
+server/src/types/express.d.ts
